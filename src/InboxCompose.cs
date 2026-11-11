@@ -17,7 +17,7 @@ namespace TodoLite
 
         private readonly SoftTextBox _box;
         private string _title = "\u6536\u4ef6\u7bb1";
-        private string _emptyHint = "\u5199\u4e0b\u8981\u505a\u7684\u4e8b\uff0c\u6309 Enter \u8bb0\u5165 TODO";
+        private string _targetPaneName = "TODO";
         private string _buttonText = "\u8bb0\u4e0b";
 
         private bool _buttonHover;
@@ -62,6 +62,19 @@ namespace TodoLite
         {
             get { return _title; }
             set { _title = value == null ? string.Empty : value; Invalidate(); }
+        }
+
+        /// <summary>新条目将进入的栏名，用于空态提示。</summary>
+        public string TargetPaneName
+        {
+            get { return _targetPaneName; }
+            set
+            {
+                string v = value == null || value.Length == 0 ? "TODO" : value;
+                if (_targetPaneName == v) return;
+                _targetPaneName = v;
+                Invalidate();
+            }
         }
 
         public string DraftText
@@ -181,13 +194,15 @@ namespace TodoLite
                                        | TextFormatFlags.NoPrefix;
             TextRenderer.DrawText(g, _title, Ui.Title, header, Ui.TextPrimary, titleFlags);
 
-            if (_box.TextLength == 0 && !_box.Focused)
+            if (_box.TextLength == 0)
             {
                 Rectangle left = new Rectangle(Pad, FooterTop, Math.Max(0, ButtonRect().X - Pad - Scale(8)), FooterHeight);
-                TextFormatFlags emptyFlags = TextFormatFlags.Left | TextFormatFlags.VerticalCenter
-                                           | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis
-                                           | TextFormatFlags.NoPrefix;
-                TextRenderer.DrawText(g, _emptyHint, Ui.Small, left, Ui.TextFaint, emptyFlags);
+                // 输入框获得焦点时提示右对齐，避免和左侧光标重叠。
+                TextFormatFlags emptyFlags = (_box.Focused ? TextFormatFlags.Right : TextFormatFlags.Left)
+                                           | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine
+                                           | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix;
+                string hint = "\u5199\u4e0b\u8981\u505a\u7684\u4e8b\uff0c\u6309 Enter \u8bb0\u5165\u300c" + _targetPaneName + "\u300d";
+                TextRenderer.DrawText(g, hint, Ui.Small, left, Ui.TextFaint, emptyFlags);
             }
 
             Color buttonColor = (_buttonHover || _buttonPressed) ? Ui.TextPrimary : Ui.TextMuted;

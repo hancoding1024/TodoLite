@@ -11,16 +11,18 @@ namespace TodoLite
     {
         private readonly TodoStore _store = new TodoStore();
         private readonly InboxCompose _compose;
-        private readonly TaskListView _list;
-        private readonly ContextMenuStrip _todoMenu;
-        private readonly ToolStripMenuItem _clearDoneItem;
+        private readonly List<TaskListView> _lists = new List<TaskListView>();
+        private readonly List<ContextMenuStrip> _menus = new List<ContextMenuStrip>();
         private readonly Timer _draftTimer;
 
         private bool _saveWarned;
+        private int _activePane;
 
+        private int _dragPane = -1;
         private int _dragIndex = -1;
         private Point _dragOrigin;
         private bool _dragging;
+        private int _dropPane = -1;
         private int _dropIndex = -1;
 
         public MainForm()
@@ -34,7 +36,7 @@ namespace TodoLite
             DoubleBuffered = true;
             KeyPreview = true;
             ClientSize = new Size((int)(900 * scale), (int)(600 * scale));
-            MinimumSize = new Size((int)(740 * scale), (int)(520 * scale));
+            MinimumSize = new Size((int)(680 * scale), (int)(520 * scale));
             FormBorderStyle = FormBorderStyle.Sizable;
             MaximizeBox = true;
             MinimizeBox = true;
@@ -45,38 +47,21 @@ namespace TodoLite
             _compose.Title = "\u6536\u4ef6\u7bb1";
             Controls.Add(_compose);
 
-            _list = new TaskListView();
-            _list.Title = "TODO";
-            Controls.Add(_list);
-
-            _clearDoneItem = new ToolStripMenuItem("\u6e05\u9664\u5df2\u5b8c\u6210");
-            _clearDoneItem.Click += ClearDoneClick;
-
-            _todoMenu = new ContextMenuStrip();
-            _todoMenu.Font = Ui.Body;
-            _todoMenu.BackColor = Ui.CardBack;
-            _todoMenu.ForeColor = Ui.TextPrimary;
-            _todoMenu.ShowImageMargin = false;
-            _todoMenu.Items.Add(_clearDoneItem);
-            _todoMenu.Opening += TodoMenuOpening;
-            _list.ContextMenuStrip = _todoMenu;
+            _compose.SubmitRequested += ComposeSubmit;
+            _compose.DraftChanged += ComposeDraftChanged;
 
             _draftTimer = new Timer();
             _draftTimer.Interval = 800;
             _draftTimer.Tick += DraftTimerTick;
 
-            _compose.SubmitRequested += ComposeSubmit;
-            _compose.DraftChanged += ComposeDraftChanged;
-            _list.Command += ListCommand;
-            _list.TextEdited += ListTextEdited;
-            _list.MouseDown += ListMouseDown;
-            _list.MouseMove += ListMouseMove;
-            _list.MouseUp += ListMouseUp;
-
             _store.Load();
+            EnsurePaneViews();
+
             _compose.SetDraft(_store.Draft);
             // 控件里会把换行规范化，这里同步回去，保持内存与界面一致。
             _store.SetDraft(_compose.DraftText);
+
+            _activePane = 0;
             RefreshViews();
         }
 
@@ -134,22 +119,24 @@ namespace TodoLite
         {
             base.OnResize(e);
             LayoutCards();
+            for (int i = 0; i < _lists.Count; i++) _lists[i].CanSplit = CanSplitPane();
         }
 
-        /// <summary>上下两段：上方收件箱约 1/3，下方 TODO 撑满剩余高度。</summary>
+        /// <summary>上方收件箱约 1/3，下方按当前栏数等宽并排。</summary>
         private void LayoutCards()
         {
-            if (_compose == null || _list == null) return;
+            if (_compose == null || _lists.Count == 0) return;
 
             int pad = Scale(24);
             int gap = Scale(18);
+            int colGap = Scale(18);
             int width = ClientSize.Width - pad * 2;
             int height = ClientSize.Height - pad * 2;
             if (width < Scale(80) || height < Scale(120)) return;
 
             int minTop = Scale(130);
             int minBottom = Scale(150);
-            int top = (int)Math.Round(height * 0.34);
+            int top = (int)Math.Round(height * 0.32);
             if (top < minTop) top = minTop;
             if (top > height - minBottom - gap) top = height - minBottom - gap;
             if (top < Scale(70)) top = Math.Max(Scale(60), height / 3);
@@ -157,7 +144,33 @@ namespace TodoLite
             if (bottom < Scale(60)) bottom = Math.Max(Scale(40), bottom);
 
             _compose.SetBounds(pad, pad, width, top);
-            _list.SetBounds(pad, pad + top + gap, width, bottom);
+
+            int count = _lists.Count;
+            int totalGap = colGap * (count - 1);
+            int colWidth = (width - totalGap) / count;
+            if (colWidth < Scale(80)) colWidth = Scale(80);
+
+            int listTop = pad + top + gap;
+            for (int i = 0; i < count; i++)
+            {
+                int x = pad + i * (colWidth + colGap);
+                int w = (i == count - 1) ? width - (x - pad) : colWidth;
+                _lists[i].SetBounds(x, listTop, Math.Max(0, w), bottom);
+            }
+        }
+
+        /// <summary>当前窗口宽度是否还放得下再拆一栏。</summary>
+        private bool CanSplitPane()
+        {
+            if (!_store.CanAddPane) return false;
+
+            int pad = Scale(24);
+            int colGap = Scale(18);
+            int width = ClientSize.Width - pad * 2;
+            int count = _lists.Count + 1;
+            if (count <= 1) return true;
+            int each = (width - colGap * (count - 1)) / count;
+            return each >= Scale(180);
         }
 
         protected override void OnShown(EventArgs e)
@@ -166,7 +179,7 @@ namespace TodoLite
 
             if (_store.MigratedOnLoad)
             {
-                // 旧版收件箱条目已并入 TODO，落盘一次完成格式升级。
+                // 旧版数据已升级为新结构，落盘一次完成格式升级。
                 Save();
             }
 
@@ -189,20 +202,140 @@ namespace TodoLite
         }
 
         // ------------------------------------------------------------------
+        // 栏视图
+        // ------------------------------------------------------------------
+        private void EnsurePaneViews()
+        {
+            while (_lists.Count < _store.PaneCount)
+            {
+                TaskListView list = CreateList();
+                _lists.Add(list);
+                Controls.Add(list);
+            }
+
+            while (_lists.Count > _store.PaneCount && _lists.Count > 1)
+            {
+                int last = _lists.Count - 1;
+                TaskListView list = _lists[last];
+                _lists.RemoveAt(last);
+                Controls.Remove(list);
+                list.Dispose();
+
+                ContextMenuStrip menu = _menus[last];
+                _menus.RemoveAt(last);
+                menu.Dispose();
+            }
+
+            if (_activePane >= _lists.Count) _activePane = _lists.Count - 1;
+            if (_activePane < 0) _activePane = 0;
+            LayoutCards();
+        }
+
+        private TaskListView CreateList()
+        {
+            TaskListView list = new TaskListView();
+            list.Command += ListCommand;
+            list.TextEdited += ListTextEdited;
+            list.TitleEdited += ListTitleEdited;
+            list.SplitRequested += ListSplitRequested;
+            list.MouseDown += ListMouseDown;
+            list.MouseMove += ListMouseMove;
+            list.MouseUp += ListMouseUp;
+            list.GotFocus += ListGotFocus;
+
+            ContextMenuStrip menu = new ContextMenuStrip();
+            menu.Font = Ui.Body;
+            menu.BackColor = Ui.CardBack;
+            menu.ForeColor = Ui.TextPrimary;
+            menu.ShowImageMargin = false;
+
+            ToolStripMenuItem split = new ToolStripMenuItem("\u62c6\u5206\u65b0\u680f");
+            split.Click += delegate { SplitPane(PaneOf(list)); };
+
+            ToolStripMenuItem merge = new ToolStripMenuItem("\u5408\u5e76\u672c\u680f");
+            merge.Click += delegate { MergePane(PaneOf(list)); };
+
+            ToolStripMenuItem rename = new ToolStripMenuItem("\u91cd\u547d\u540d\u672c\u680f");
+            rename.Click += delegate { _lists[PaneOf(list)].BeginEditTitle(); };
+
+            ToolStripMenuItem clear = new ToolStripMenuItem("\u6e05\u9664\u672c\u680f\u5df2\u5b8c\u6210");
+            clear.Click += delegate { ClearDone(PaneOf(list)); };
+
+            menu.Items.Add(split);
+            menu.Items.Add(merge);
+            menu.Items.Add(rename);
+            menu.Items.Add(clear);
+            menu.Opening += MenuOpening;
+
+            list.ContextMenuStrip = menu;
+            _menus.Add(menu);
+            return list;
+        }
+
+        private void SplitPane(int pane)
+        {
+            if (pane < 0 || pane >= _lists.Count) return;
+            if (!CanSplitPane()) return;
+
+            int index = _store.InsertPane(pane + 1);
+            if (index < 0) return;
+
+            EnsurePaneViews();
+            Save();
+            RefreshViews();
+            SetActivePane(index);
+            _lists[index].Focus();
+        }
+
+        private void MergePane(int pane)
+        {
+            if (pane < 0 || pane >= _lists.Count) return;
+            if (_store.PaneCount <= 1) return;
+
+            int target = pane > 0 ? pane - 1 : pane + 1;
+            if (!_store.MergePane(pane, target)) return;
+
+            EnsurePaneViews();
+            Save();
+            RefreshViews();
+
+            int active = pane < _lists.Count ? pane : _lists.Count - 1;
+            if (active < 0) active = 0;
+            SetActivePane(active);
+            _lists[active].Focus();
+        }
+
+        // ------------------------------------------------------------------
         // 视图刷新
         // ------------------------------------------------------------------
         private void RefreshViews()
         {
-            List<ITaskItem> items = new List<ITaskItem>(_store.Todo.Count);
-            int undone = 0;
-            for (int i = 0; i < _store.Todo.Count; i++)
+            bool canSplit = CanSplitPane();
+
+            for (int pane = 0; pane < _lists.Count; pane++)
             {
-                TodoItem item = _store.Todo[i];
-                items.Add(item);
-                if (!item.Done) undone++;
+                TodoPane source = _store.PaneAt(pane);
+                TaskListView list = _lists[pane];
+                if (source == null || list == null) continue;
+
+                List<ITaskItem> items = new List<ITaskItem>(source.Items.Count);
+                int undone = 0;
+                for (int i = 0; i < source.Items.Count; i++)
+                {
+                    TodoItem item = source.Items[i];
+                    items.Add(item);
+                    if (!item.Done) undone++;
+                }
+
+                list.Title = source.Title;
+                list.Count = undone;
+                list.CanSplit = canSplit;
+                list.Active = pane == _activePane;
+                list.SetItems(items);
             }
-            _list.SetItems(items);
-            _list.Count = undone;
+
+            TodoPane active = _store.PaneAt(_activePane);
+            if (active != null) _compose.TargetPaneName = active.Title;
         }
 
         private void Save()
@@ -216,16 +349,81 @@ namespace TodoLite
         }
 
         // ------------------------------------------------------------------
+        // 栏与选中
+        // ------------------------------------------------------------------
+        private int PaneOf(object sender)
+        {
+            for (int i = 0; i < _lists.Count; i++)
+            {
+                if (ReferenceEquals(_lists[i], sender)) return i;
+            }
+            return _activePane;
+        }
+
+        private int FocusedPane()
+        {
+            for (int i = 0; i < _lists.Count; i++)
+            {
+                if (_lists[i] != null && _lists[i].Focused) return i;
+            }
+            return _activePane;
+        }
+
+        private void SetActivePane(int pane)
+        {
+            if (pane < 0) pane = 0;
+            if (pane >= _lists.Count) pane = _lists.Count - 1;
+            if (pane < 0) return;
+
+            _activePane = pane;
+            for (int i = 0; i < _lists.Count; i++)
+            {
+                if (_lists[i] != null) _lists[i].Active = i == pane;
+            }
+
+            TodoPane source = _store.PaneAt(pane);
+            if (source != null) _compose.TargetPaneName = source.Title;
+        }
+
+        private void ListGotFocus(object sender, EventArgs e)
+        {
+            SetActivePane(PaneOf(sender));
+        }
+
+        private void ListSplitRequested(object sender, EventArgs e)
+        {
+            SplitPane(PaneOf(sender));
+        }
+
+        private TodoItem ResolveItem(int pane, int index, ITaskItem item)
+        {
+            TodoItem todo = item as TodoItem;
+            if (todo != null && _store.IndexOf(pane, todo) >= 0) return todo;
+
+            TodoPane source = _store.PaneAt(pane);
+            if (source != null && index >= 0 && index < source.Items.Count) return source.Items[index];
+            return null;
+        }
+
+        private void SelectItem(int pane, TodoItem item)
+        {
+            if (item == null || pane < 0 || pane >= _lists.Count) return;
+            int index = _store.IndexOf(pane, item);
+            if (index >= 0) _lists[pane].SelectedIndex = index;
+        }
+
+        // ------------------------------------------------------------------
         // 收件箱：提交与草稿
         // ------------------------------------------------------------------
         private void ComposeSubmit(object sender, TextEventArgs e)
         {
             if (e.Text == null || e.Text.Length == 0) return;
-            _store.Todo.Add(new TodoItem(e.Text));
+
+            TodoItem item = _store.AddItem(_activePane, e.Text);
             _store.SetDraft(_compose.DraftText);
             Save();
             RefreshViews();
-            _list.SelectedIndex = _store.Todo.Count - 1;
+            SelectItem(_activePane, item);
         }
 
         private void ComposeDraftChanged(object sender, EventArgs e)
@@ -243,61 +441,97 @@ namespace TodoLite
         }
 
         // ------------------------------------------------------------------
-        // 行内按钮：勾选 / 删除
+        // 行内按钮：勾选 / 星标 / 删除
         // ------------------------------------------------------------------
         private void ListCommand(object sender, TaskItemEventArgs e)
         {
-            int index = e.Index;
-            if (index < 0 || index >= _store.Todo.Count) return;
+            int pane = PaneOf(sender);
+            TodoItem item = ResolveItem(pane, e.Index, e.Item);
+            if (item == null) return;
+
+            int index = _store.IndexOf(pane, item);
+            if (index < 0) return;
 
             if (e.Command == TaskCommand.Delete)
             {
-                _store.Todo.RemoveAt(index);
+                _store.RemoveAt(pane, index);
+                Save();
+                RefreshViews();
+                int count = _lists[pane].ItemCount;
+                _lists[pane].SelectedIndex = index >= count ? count - 1 : index;
             }
             else if (e.Command == TaskCommand.Toggle)
             {
-                _store.Todo[index].Done = !_store.Todo[index].Done;
+                _store.ToggleDone(pane, index);
+                Save();
+                RefreshViews();
+                SelectItem(pane, item);
             }
-            else
+            else if (e.Command == TaskCommand.Star)
             {
-                return;
+                _store.ToggleStar(pane, index);
+                Save();
+                RefreshViews();
+                SelectItem(pane, item);
             }
-
-            Save();
-            RefreshViews();
         }
 
         private void ListTextEdited(object sender, TaskItemEventArgs e)
         {
             if (e.Text == null) return;
-            if (e.Index < 0 || e.Index >= _store.Todo.Count) return;
-            _store.Todo[e.Index].Text = e.Text;
+            int pane = PaneOf(sender);
+            TodoItem item = ResolveItem(pane, e.Index, e.Item);
+            if (item == null) return;
+
+            item.Text = e.Text;
             Save();
             RefreshViews();
         }
 
-        private void TodoMenuOpening(object sender, CancelEventArgs e)
+        private void ListTitleEdited(object sender, TextEventArgs e)
         {
-            bool hasDone = false;
-            for (int i = 0; i < _store.Todo.Count; i++)
-            {
-                if (_store.Todo[i].Done) { hasDone = true; break; }
-            }
-            _clearDoneItem.Enabled = hasDone;
+            int pane = PaneOf(sender);
+            bool renamed = _store.RenamePane(pane, e.Text);
+            if (renamed) Save();
+            RefreshViews();
         }
 
-        private void ClearDoneClick(object sender, EventArgs e)
+        private void MenuOpening(object sender, CancelEventArgs e)
         {
-            for (int i = _store.Todo.Count - 1; i >= 0; i--)
+            ContextMenuStrip menu = sender as ContextMenuStrip;
+            if (menu == null) return;
+
+            int pane = PaneOf(menu.SourceControl);
+            TodoPane source = _store.PaneAt(pane);
+
+            bool hasDone = false;
+            if (source != null)
             {
-                if (_store.Todo[i].Done) _store.Todo.RemoveAt(i);
+                for (int i = 0; i < source.Items.Count; i++)
+                {
+                    if (source.Items[i].Done) { hasDone = true; break; }
+                }
             }
+
+            if (menu.Items.Count >= 4)
+            {
+                menu.Items[0].Enabled = CanSplitPane();
+                menu.Items[1].Enabled = _store.PaneCount > 1;
+                menu.Items[3].Enabled = hasDone;
+            }
+
+            SetActivePane(pane);
+        }
+
+        private void ClearDone(int pane)
+        {
+            if (_store.ClearDone(pane) <= 0) return;
             Save();
             RefreshViews();
         }
 
         // ------------------------------------------------------------------
-        // 快捷键：F2 编辑、Delete 删除
+        // 快捷键：F2 编辑、Delete 删除、Space 完成、S 星标
         // ------------------------------------------------------------------
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
@@ -308,85 +542,176 @@ namespace TodoLite
             }
             if (keyData == (Keys.Control | Keys.D2) || keyData == (Keys.Control | Keys.NumPad2))
             {
-                _list.Focus();
+                SetActivePane(0);
+                _lists[0].Focus();
+                return true;
+            }
+            if (keyData == (Keys.Control | Keys.D3) || keyData == (Keys.Control | Keys.NumPad3))
+            {
+                if (_lists.Count < 2) return true;
+                SetActivePane(1);
+                _lists[1].Focus();
                 return true;
             }
 
-            bool typing = _compose.TextHasFocus || _list.IsEditing;
-            if (!typing)
+            bool typing = _compose.TextHasFocus;
+            for (int i = 0; i < _lists.Count; i++)
             {
-                if (keyData == Keys.F2)
-                {
-                    _list.BeginEditSelected();
-                    return true;
-                }
-                if (keyData == Keys.Delete)
-                {
-                    DeleteSelected();
-                    return true;
-                }
+                if (_lists[i] != null && _lists[i].IsEditing) typing = true;
+            }
+            if (typing) return base.ProcessCmdKey(ref msg, keyData);
+
+            if (keyData == Keys.F2)
+            {
+                _lists[FocusedPane()].BeginEditSelected();
+                return true;
+            }
+            if (keyData == Keys.Delete)
+            {
+                DeleteSelected();
+                return true;
+            }
+            if (keyData == Keys.Space)
+            {
+                ToggleSelected(TaskCommand.Toggle);
+                return true;
+            }
+            if (keyData == Keys.S)
+            {
+                ToggleSelected(TaskCommand.Star);
+                return true;
             }
 
             return base.ProcessCmdKey(ref msg, keyData);
         }
 
-        private void DeleteSelected()
+        private void ToggleSelected(TaskCommand command)
         {
-            int index = _list.SelectedIndex;
-            if (index < 0 || index >= _store.Todo.Count) return;
-            _store.Todo.RemoveAt(index);
+            int pane = FocusedPane();
+            if (pane < 0 || pane >= _lists.Count) return;
+
+            int index = _lists[pane].SelectedIndex;
+            TodoPane source = _store.PaneAt(pane);
+            if (source == null || index < 0 || index >= source.Items.Count) return;
+
+            TodoItem item = source.Items[index];
+
+            if (command == TaskCommand.Toggle) _store.ToggleDone(pane, index);
+            else _store.ToggleStar(pane, index);
+
             Save();
             RefreshViews();
-            _list.SelectedIndex = index >= _list.ItemCount ? _list.ItemCount - 1 : index;
+            SelectItem(pane, item);
+        }
+
+        private void DeleteSelected()
+        {
+            int pane = FocusedPane();
+            if (pane < 0 || pane >= _lists.Count) return;
+
+            int index = _lists[pane].SelectedIndex;
+            TodoPane source = _store.PaneAt(pane);
+            if (source == null || index < 0 || index >= source.Items.Count) return;
+
+            _store.RemoveAt(pane, index);
+            Save();
+            RefreshViews();
+            int count = _lists[pane].ItemCount;
+            _lists[pane].SelectedIndex = index >= count ? count - 1 : index;
         }
 
         // ------------------------------------------------------------------
-        // 拖拽（仅在 TODO 列表内重排）
+        // 拖拽（栏内重排 + 跨栏移动）
         // ------------------------------------------------------------------
         private void ListMouseDown(object sender, MouseEventArgs e)
         {
-            FinishDrag();
+            int pane = PaneOf(sender);
+            SetActivePane(pane);
+            // 只清理上一次拖拽的残留，不能清行内按钮的按下状态（否则点击会失效）。
+            ResetDragState();
             if (e.Button != MouseButtons.Left) return;
-            if (_list.PressedButton != TaskCommand.None) return;
+
+            TaskListView list = _lists[pane];
+            if (list.PressedButton != TaskCommand.None) return;
 
             int index;
-            if (!_list.TryHitRow(e.Location, out index)) return;
+            if (!list.TryHitRow(e.Location, out index)) return;
 
+            _dragPane = pane;
             _dragIndex = index;
-            _dragOrigin = _list.PointToScreen(e.Location);
+            _dragOrigin = list.PointToScreen(e.Location);
         }
 
         private void ListMouseMove(object sender, MouseEventArgs e)
         {
-            if (_dragIndex < 0) return;
+            if (_dragIndex < 0 || _dragPane < 0 || _dragPane >= _lists.Count) return;
 
+            TaskListView source = _lists[_dragPane];
             if (!_dragging)
             {
-                Point screen = _list.PointToScreen(e.Location);
+                Point screen = source.PointToScreen(e.Location);
                 Size limit = SystemInformation.DragSize;
                 if (Math.Abs(screen.X - _dragOrigin.X) < limit.Width
                     && Math.Abs(screen.Y - _dragOrigin.Y) < limit.Height) return;
 
                 _dragging = true;
-                _list.DragActive = true;
-                _list.SetDragSource(_dragIndex);
-                _list.Cursor = Cursors.Default;
+                source.DragActive = true;
+                source.SetDragSource(_dragIndex);
+                source.Cursor = Cursors.Default;
             }
 
-            _dropIndex = _list.GetInsertIndex(e.Location);
-            _list.SetDropIndicator(_dropIndex);
+            UpdateDropTarget();
+        }
+
+        private void UpdateDropTarget()
+        {
+            Point screen = Cursor.Position;
+            int target = -1;
+            for (int i = 0; i < _lists.Count; i++)
+            {
+                if (_lists[i] == null) continue;
+                Rectangle bounds = _lists[i].RectangleToScreen(_lists[i].ClientRectangle);
+                if (bounds.Contains(screen)) { target = i; break; }
+            }
+
+            for (int i = 0; i < _lists.Count; i++)
+            {
+                if (_lists[i] == null) continue;
+                bool over = i == target;
+                _lists[i].IsDragOver = over;
+                if (!over) _lists[i].ClearDropIndicator();
+            }
+
+            _dropPane = target;
+            _dropIndex = -1;
+
+            if (target < 0) return;
+
+            TaskListView list = _lists[target];
+            Point local = list.PointToClient(screen);
+            ITaskItem dragged = _lists[_dragPane].ItemAt(_dragIndex);
+            int insert = list.GetInsertIndex(local, dragged);
+            _dropIndex = insert;
+            list.SetDropIndicator(insert);
+            list.AutoScrollForDrag(local);
         }
 
         private void ListMouseUp(object sender, MouseEventArgs e)
         {
-            if (_dragging && _dragIndex >= 0 && _dropIndex >= 0)
+            if (_dragging && _dragPane >= 0 && _dragIndex >= 0 && _dropPane >= 0 && _dropIndex >= 0)
             {
-                int from = _dragIndex;
+                int fromPane = _dragPane;
+                int fromIndex = _dragIndex;
+                int toPane = _dropPane;
                 int insert = _dropIndex;
+
+                TodoItem item = _lists[fromPane].ItemAt(fromIndex) as TodoItem;
                 FinishDrag();
-                Reorder(from, insert);
+
+                if (item != null) MoveItemBetween(fromPane, item, toPane, insert);
                 return;
             }
+
             FinishDrag();
         }
 
@@ -396,38 +721,46 @@ namespace TodoLite
             base.OnMouseUp(e);
         }
 
-        private void FinishDrag()
+        private void ResetDragState()
         {
-            if (_dragging || _dragIndex >= 0)
+            for (int i = 0; i < _lists.Count; i++)
             {
-                _list.DragActive = false;
-                _list.ClearDragSource();
-                _list.ClearPressedState();
+                if (_lists[i] == null) continue;
+                _lists[i].DragActive = false;
+                _lists[i].IsDragOver = false;
+                _lists[i].ClearDragSource();
+                _lists[i].ClearDropIndicator();
             }
-            _list.ClearDropIndicator();
             _dragging = false;
+            _dragPane = -1;
             _dragIndex = -1;
+            _dropPane = -1;
             _dropIndex = -1;
         }
 
-        private void Reorder(int from, int insert)
+        private void FinishDrag()
         {
-            if (from < 0 || from >= _store.Todo.Count) return;
+            ResetDragState();
+            for (int i = 0; i < _lists.Count; i++)
+            {
+                if (_lists[i] == null) continue;
+                _lists[i].ClearPressedState();
+            }
+        }
 
-            int target = insert;
-            if (target > from) target--;
-            if (target < 0) target = 0;
-            if (target > _store.Todo.Count - 1) target = _store.Todo.Count - 1;
-            if (target == from) return;
-
-            TodoItem item = _store.Todo[from];
-            _store.Todo.RemoveAt(from);
-            _store.Todo.Insert(target, item);
+        private void MoveItemBetween(int fromPane, TodoItem item, int toPane, int insertIndex)
+        {
+            if (!_store.MoveItem(fromPane, item, toPane, insertIndex))
+            {
+                RefreshViews();
+                return;
+            }
 
             Save();
             RefreshViews();
-            _list.SelectedIndex = target;
-            _list.Focus();
+            SelectItem(toPane, item);
+            SetActivePane(toPane);
+            _lists[toPane].Focus();
         }
     }
 }
